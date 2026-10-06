@@ -4,10 +4,12 @@ Pseudo-code: guides/pseudocode/04_curator.md
 Kiểm tra:    pytest tests/test_04_curator.py
 Chạy thật:   python -m lab.curator
 """
+import json
 import re
 from pathlib import Path
 
-from .tasks import eval_markers   # có sẵn: định danh của tác vụ đánh giá, tính lúc chạy
+from .model import make_model
+from .tasks import ROOT, eval_markers   # có sẵn: định danh của tác vụ đánh giá, tính lúc chạy
 
 # ---- CÓ SẴN, KHÔNG SỬA: kiểm tra và tách khối skill (phần dễ sai và liên quan bảo mật) ----------------
 SAFE_NAME = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
@@ -68,7 +70,85 @@ def curate_skills(results_dir="results", source_condition="baseline", out_dir=No
     model mặc định: make_model() (lab.model).
     Trả về: danh sách đường dẫn SKILL.md đã ghi.
     """
-    raise NotImplementedError("TODO: cài đặt curate_skills (xem guides/pseudocode/04_curator.md)")
+    results_dir = Path(results_dir)
+    out_dir = Path(out_dir) if out_dir is not None else ROOT / "skills" / "auto"
+
+    runs = []
+    condition_dir = results_dir / source_condition
+    for run_file in sorted(condition_dir.glob("*/run.json")):
+        try:
+            record = json.loads(run_file.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            continue
+        if record.get("role") != "learn":
+            continue
+
+        failed = [
+            (str(check.get("name", "")), str(check.get("detail", "")))
+            for check in record.get("checks", [])
+            if not check.get("passed")
+        ]
+        if not failed:
+            continue
+        trace_file = run_file.with_name("trace.md")
+        trace = trace_file.read_text(encoding="utf-8")[-6000:] if trace_file.exists() else ""
+        runs.append({
+            "task": record.get("task", run_file.parent.name),
+            "failed": failed,
+            "trace": trace,
+        })
+
+    if not runs:
+        print("warning: no failed checks in learning tasks")
+        return []
+
+    sections = []
+    for run in runs:
+        checks = "\n".join(
+            f"- {name}: {detail}" if detail else f"- {name}"
+            for name, detail in run["failed"]
+        )
+        sections.append(
+            f"Task: {run['task']}\n"
+            f"Failed checks:\n{checks}\n"
+            f"Trace tail:\n{run['trace']}"
+        )
+
+    prompt = f"""You write SKILL files for a programming and data-analysis agent.
+Below are failed checks from learning tasks only, plus the trace tail from each run.
+Find general process mistakes, not task-specific answers, and write at most {max_skills} short skills
+that help avoid these mistakes on new tasks of the same type.
+
+Rules:
+- Keep each skill general: do not mention task ids, one-off file names, expected answers, or exact numbers.
+- Each skill must have YAML frontmatter with `name` (lowercase words separated by hyphens) and `description` (one sentence: when to use it).
+- The body must be a concise imperative checklist.
+- Output exactly this format for each skill:
+=== SKILL: <name> ===
+---
+name: <name>
+description: <when to use>
+---
+<body>
+=== END ===
+
+Learning runs:
+
+{chr(10).join(sections)}
+"""
+
+    reply = (model or make_model()).invoke(prompt).content
+    written = []
+    for name, text in parse_skill_blocks(reply):
+        if len(written) >= max_skills:
+            break
+        if validate_skill(text, expected_name=name):
+            continue
+        skill_file = out_dir / name / "SKILL.md"
+        skill_file.parent.mkdir(parents=True, exist_ok=True)
+        skill_file.write_text(text.strip() + "\n", encoding="utf-8")
+        written.append(skill_file)
+    return written
 
 
 if __name__ == "__main__":
